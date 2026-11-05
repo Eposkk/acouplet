@@ -127,11 +127,19 @@ static BOOL FragmentedCommandPossible(const uint8_t *bytes, NSUInteger length) {
     return NO;
 }
 
-static void Candidate(const uint8_t *bytes, NSUInteger length, NSUInteger end,
+// The framing marker (F0 3F) is answered with a General Reject. AVDTP requires the reply to
+// echo the marker's label (F1 3F); Sony WF-1000XM4 firmware echoes the label of the query it
+// is answering instead (e.g. 11 3F after a DISCOVER with label 1). Both end the response.
+static BOOL IsMarkerReply(const uint8_t *bytes, NSUInteger remaining, uint8_t transaction) {
+    return remaining >= 2 && bytes[1] == 0x3F &&
+        (bytes[0] == 0xF1 || bytes[0] == (uint8_t)((transaction << 4) | 1));
+}
+
+static void Candidate(const uint8_t *bytes, NSUInteger length, NSUInteger end, uint8_t transaction,
                       BOOL rejected, Parsed *parsed, NSUInteger *solutions, BOOL *unsupported) {
     NSUInteger offset = end, commands = 0;
     while (offset < length) {
-        if (length - offset >= 2 && bytes[offset] == 0xF1 && bytes[offset + 1] == 0x3F) {
+        if (IsMarkerReply(bytes + offset, length - offset, transaction)) {
             *parsed = (Parsed){end, offset + 2, commands, rejected};
             (*solutions)++;
             return;
@@ -169,9 +177,9 @@ static int Parse(const uint8_t *bytes, NSUInteger length, uint8_t transaction, u
             case 3: case 7: case 9: size = 4; break;
             default: return -1;
         }
-        if (length >= size) Candidate(bytes, length, size, YES, parsed, &solutions, &unsupported);
+        if (length >= size) Candidate(bytes, length, size, transaction, YES, parsed, &solutions, &unsupported);
     } else if (signal == 3 || (signal >= 6 && signal <= 10)) {
-        Candidate(bytes, length, 2, NO, parsed, &solutions, &unsupported);
+        Candidate(bytes, length, 2, transaction, NO, parsed, &solutions, &unsupported);
     } else if (signal == 1) {
         uint64_t seen = 0;
         for (NSUInteger offset = 2; offset + 2 <= length; offset += 2) {
@@ -179,14 +187,14 @@ static int Parse(const uint8_t *bytes, NSUInteger length, uint8_t transaction, u
             if ((bytes[offset] & 1) || seid < 1 || seid > 62 || (seen & (1ULL << seid)) ||
                 (info & 7) || (info >> 4) > 2) break;
             seen |= 1ULL << seid;
-            Candidate(bytes, length, offset + 2, NO, parsed, &solutions, &unsupported);
+            Candidate(bytes, length, offset + 2, transaction, NO, parsed, &solutions, &unsupported);
         }
     } else if (signal == 2 || signal == 4 || signal == 12) {
         unsigned seen = 0;
         NSUInteger offset = 2;
         NSUInteger alternateSolutions = 0;
         Parsed alternate;
-        Candidate(bytes, length, offset, NO, &alternate, &alternateSolutions, &unsupported);
+        Candidate(bytes, length, offset, transaction, NO, &alternate, &alternateSolutions, &unsupported);
         if (alternateSolutions) unsupported = YES;
         while (offset + 2 <= length) {
             uint8_t category = bytes[offset], size = bytes[offset + 1];
@@ -195,10 +203,10 @@ static int Parse(const uint8_t *bytes, NSUInteger length, uint8_t transaction, u
             seen |= 1U << category;
             offset += 2 + size;
             if (offset > length) break;
-            if ((seen & (1U << 1)) && (seen & (1U << 7))) Candidate(bytes, length, offset, NO, parsed, &solutions, &unsupported);
+            if ((seen & (1U << 1)) && (seen & (1U << 7))) Candidate(bytes, length, offset, transaction, NO, parsed, &solutions, &unsupported);
             else {
                 alternateSolutions = 0;
-                Candidate(bytes, length, offset, NO, &alternate, &alternateSolutions, &unsupported);
+                Candidate(bytes, length, offset, transaction, NO, &alternate, &alternateSolutions, &unsupported);
                 if (alternateSolutions) unsupported = YES;
             }
         }
@@ -553,6 +561,8 @@ static NSData *AwaitResponse(DirectPlaybackProbe *probe, uint8_t transaction, ui
         NSData *reply = [probe.pending subdataWithRange:NSMakeRange(0, parsed.responseLength)];
         NSData *commands = [probe.pending subdataWithRange:NSMakeRange(parsed.responseLength,
             parsed.consumed - parsed.responseLength - (fixed ? 0 : 2))];
+        if (!fixed && ((const uint8_t *)probe.pending.bytes)[parsed.consumed - 2] != 0xF1)
+            printf("MARKER_REPLY_LABEL_QUIRK transaction=%u\n", transaction);
         [probe.pending replaceBytesInRange:NSMakeRange(0, parsed.consumed) withBytes:NULL length:0];
         probe.framingUncertain = NO;
         const uint8_t *bytes = commands.bytes;

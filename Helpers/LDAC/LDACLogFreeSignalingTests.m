@@ -262,6 +262,59 @@ static void PlaybackCase(BOOL stop, BOOL wrongConfiguration, uint32_t rate, BOOL
     output.onWrite = nil;
 }
 
+// Spec-compliant headphones answer the framing marker with F1 3F regardless of the query label.
+// Accepting the WF-1000XM4 label echo must not change how those replies are framed at any label.
+static void SpecMarkerCase(NSData *response, uint8_t signal, uint8_t transaction) {
+    ResetParent();
+    DirectPlaybackProbe *probe = Probe();
+    TestInput *input = (id)probe.input;
+    TestOutput *output = (id)probe.output;
+    NSMutableData *labelled = [response mutableCopy];
+    ((uint8_t *)labelled.mutableBytes)[0] = (uint8_t)((transaction << 4) | (((const uint8_t *)response.bytes)[0] & 0x0F));
+    output.onWrite = ^(NSData *packet) {
+        const uint8_t *bytes = packet.bytes;
+        if (bytes[0] == (uint8_t)(transaction << 4) && bytes[1] == signal) Chunks(input, labelled, 0, NO);
+        else if (bytes[0] == 0xF0 && bytes[1] == 0x3F) Chunks(input, Hex(@"f1 3f"), 0, NO);
+    };
+    uint8_t label = transaction;
+    NSData *reply = Query(probe, &label, signal, [NSData data]);
+    Check([reply isEqualToData:labelled] && !probe.pending.length && !probe.framingUncertain && !probe.failed,
+          "spec-labelled marker still accepted at every query label");
+    output.onWrite = nil;
+}
+
+// WF-1000XM4 answers the framing marker (F0 3F) with a General Reject that carries the
+// outstanding query's transaction label instead of the marker's label 0xF (e.g. 11 3F).
+static void MarkerLabelCase(uint8_t transaction, NSData *marker, BOOL accepted) {
+    ResetParent();
+    DirectPlaybackProbe *probe = Probe();
+    probe.hardDeadline = MonotonicTime() + 0.05;
+    TestInput *input = (id)probe.input;
+    TestOutput *output = (id)probe.output;
+    uint8_t header[] = {(uint8_t)((transaction << 4) | 2), 1};
+    NSMutableData *response = [NSMutableData dataWithBytes:header length:2];
+    [response appendData:Hex(@"04 08 08 08 0c 08")];
+    __block NSUInteger markers = 0;
+    output.onWrite = ^(NSData *packet) {
+        const uint8_t *bytes = packet.bytes;
+        if (bytes[0] == (uint8_t)(transaction << 4) && bytes[1] == 1) Chunks(input, response, 0, NO);
+        else if (bytes[0] == 0xF0 && bytes[1] == 0x3F) {
+            markers++;
+            Chunks(input, marker, 0, NO);
+        }
+    };
+    uint8_t label = transaction;
+    NSData *reply = Query(probe, &label, 1, [NSData data]);
+    Check(markers == 1, "marker sent once for variable-length response");
+    if (accepted) {
+        Check([reply isEqualToData:response] && !probe.pending.length && !probe.framingUncertain && !probe.failed,
+              "marker reply carrying the query label confirms framing");
+    } else {
+        Check(reply == nil && probe.framingUncertain, "marker reply with unrelated label fails closed");
+    }
+    output.onWrite = nil;
+}
+
 int main(void) {
     @autoreleasepool {
         setbuf(stdout, NULL);
@@ -317,6 +370,28 @@ int main(void) {
         QueryCase(discover, 1, Hex(@"20 01 30 02 04 f1 3f"), 1, YES, YES, NO);
         QueryCase(Hex(@"12 0c 01 00 07 0a 00 ff 2d 01 00 00 aa 00 10 01 04 02 f1 3f"),
                   12, marker, 0, YES, YES, NO);
+        NSData *labelledMarker = Hex(@"11 3f");
+        for (NSArray *fixture in cases) {
+            NSData *response = fixture[0];
+            if (![fixture[2] boolValue] || FixedResponseLength(response.bytes, response.length, 1, [fixture[1] unsignedCharValue])) continue;
+            for (NSUInteger split = 0; split <= response.length; split++)
+                QueryCase(response, [fixture[1] unsignedCharValue], labelledMarker, split, NO, YES, NO);
+            QueryCase(response, [fixture[1] unsignedCharValue], labelledMarker, 0, YES, YES, NO);
+        }
+        MarkerLabelCase(1, Hex(@"11 3f"), YES);
+        MarkerLabelCase(2, Hex(@"21 3f"), YES);
+        MarkerLabelCase(2, Hex(@"f1 3f"), YES);
+        MarkerLabelCase(0, Hex(@"01 3f"), YES);
+        MarkerLabelCase(2, Hex(@"11 3f"), NO);
+        MarkerLabelCase(2, Hex(@"31 3f"), NO);
+        MarkerLabelCase(2, Hex(@"23 3f"), NO);
+        MarkerLabelCase(2, Hex(@"01 3f"), NO);
+        MarkerLabelCase(1, Hex(@"11 3f f1 3f"), NO);
+        for (NSArray *fixture in cases) {
+            if (![fixture[2] boolValue]) continue;
+            for (uint8_t transaction = 0; transaction < 15; transaction++)
+                SpecMarkerCase(fixture[0], [fixture[1] unsignedCharValue], transaction);
+        }
         for (NSData *bad in @[Hex(@"22 01 04 08"), Hex(@"16 01"), Hex(@"12 01 04 08 f1 3f"),
                               Hex(@"12 0c 01 00 07 0a 00 ff 2d 01 00 00 aa 00 10 01 10 07 04 f1 3f")]) {
             ResetParent();
